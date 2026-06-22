@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Challenge 3 - Stress & Diagnose. Creates one small t3.micro EC2 instance that
+  pins its CPU at 100% as soon as it boots, plus a CPU alarm. You walk into a
+  live "slow server" incident and ask the DevOps Agent to diagnose and fix it.
+  Upload this file in the CloudFormation console.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 (filled in automatically — leave as is).
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Lets you connect with one click (Session Manager) — no SSH keys needed.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  StressInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: challenge3-stress
+      # The instance pins all CPU cores at 100% as soon as it boots, so you
+      # walk into a "live incident" with no setup. SSM Agent is preinstalled on
+      # Amazon Linux 2023, so Session Manager works out of the box (no SSH keys).
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          # Launch one detached busy-loop per CPU core. setsid keeps them
+          # running after cloud-init finishes, so the CPU stays saturated.
+          for i in $(seq $(nproc)); do
+            setsid bash -c 'while true; do :; done' >/dev/null 2>&1 < /dev/null &
+          done
+
+  CpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: challenge3-high-cpu
+      AlarmDescription: EC2 CPU is high (the instance saturates its CPU on boot).
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref StressInstance
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  InstanceId:
+    Description: This instance is overloaded on boot. Investigate it with the agent.
+    Value: !Ref StressInstance
+  AlarmName:
+    Description: This alarm goes red a couple of minutes after the stack is created.
+    Value: !Ref CpuAlarm
