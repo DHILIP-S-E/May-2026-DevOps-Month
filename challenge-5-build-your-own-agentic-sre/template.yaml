@@ -196,7 +196,6 @@ Resources:
 
   SeedRealData:
     Type: Custom::SeedRealData
-    DependsOn: RealDataTable
     Properties:
       ServiceToken: !GetAtt SeederFunction.Arn
       RealTable: !Ref RealDataTable
