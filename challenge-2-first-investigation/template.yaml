@@ -1,0 +1,59 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Challenge 2 - First Investigation. Creates one tiny Lambda that is BROKEN on
+  purpose (it crashes every time you run it). You'll ask the DevOps Agent why.
+  Upload this file in the CloudFormation console (Create stack > Upload template).
+
+Resources:
+  BrokenFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: challenge2-broken-fn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt FunctionRole.Arn
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              # This function is broken on purpose. Use the DevOps Agent to
+              # find out why every invocation fails.
+              return {"result": config["value"]}
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Alarm turns red when the function errors, so the agent can see something is wrong.
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: challenge2-broken-fn-errors
+      AlarmDescription: The broken Lambda is failing (this is expected).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BrokenFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  FunctionName:
+    Description: Run (test) this function to make it fail.
+    Value: !Ref BrokenFunction
+  AlarmName:
+    Description: Watch this alarm turn red after the function fails.
+    Value: !Ref ErrorAlarm

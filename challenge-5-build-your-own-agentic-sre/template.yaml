@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Challenge 5 - The Phantom Deploy. Creates an API Gateway + Lambda + TWO DynamoDB
+  tables. Everything looks perfectly healthy: HTTP 200 OK on every call, zero Lambda
+  errors, all CloudWatch alarms green. But users always get wrong data.
+  The Lambda env var TABLE_NAME points to the shadow (empty) table instead of the
+  real one. Use DevOps Agent to find why the API returns 200 OK but data is always wrong.
+  Upload this file in the CloudFormation console (Create stack > Upload template).
+
+Resources:
+
+  # ── DynamoDB Tables ────────────────────────────────────────────────────────────
+  # The REAL table — seeded with correct product data. Lambda does NOT use this.
+  RealDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: phantom-real-data
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # The SHADOW table — empty. Lambda reads from this by mistake (the bug).
+  ShadowDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: phantom-shadow-data
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # ── IAM ────────────────────────────────────────────────────────────────────────
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadBothTables
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt RealDataTable.Arn
+                  - !GetAtt ShadowDataTable.Arn
+
+  # ── Lambda ─────────────────────────────────────────────────────────────────────
+  # The code is 100% correct. The bug is the TABLE_NAME env var below.
+  AppFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: phantom-api-fn
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      Role: !GetAtt AppRole.Arn
+      Environment:
+        Variables:
+          # BUG: should be phantom-real-data; points to the empty shadow table instead.
+          TABLE_NAME: !Ref ShadowDataTable
+      Code:
+        ZipFile: |
+          import os, json, boto3
+
+          ddb = boto3.client("dynamodb")
+          TABLE = os.environ["TABLE_NAME"]
+
+          def handler(event, context):
+              # The code is correct — it reads one item by key.
+              # If data is wrong, the problem is NOT in this code.
+              resp = ddb.get_item(
+                  TableName=TABLE,
+                  Key={"id": {"S": "prod-001"}},
+              )
+              item = resp.get("Item", {})
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps({
+                      "product": item.get("name", {}).get("S", "unknown"),
+                      "price":   item.get("price", {}).get("N", "0"),
+                      "status":  "ok",
+                  }),
+              }
+
+  # ── API Gateway ────────────────────────────────────────────────────────────────
+  PhantomApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: phantom-deploy-api
+      Description: The Phantom Deploy API — returns 200 OK but always wrong data.
+
+  ProductResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PhantomApi
+      ParentId: !GetAtt PhantomApi.RootResourceId
+      PathPart: product
+
+  GetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PhantomApi
+      ResourceId: !Ref ProductResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations
+          - FnArn: !GetAtt AppFunction.Arn
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: GetMethod
+    Properties:
+      RestApiId: !Ref PhantomApi
+      StageName: prod
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AppFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PhantomApi}/*/*
+
+  # ── Seeder — puts correct data only in the REAL table ─────────────────────────
+  SeederRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SeedRealTable
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt RealDataTable.Arn
+
+  SeederFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: phantom-seeder
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt SeederRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, cfnresponse
+
+          ddb = boto3.client("dynamodb")
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Create":
+                      ddb.put_item(
+                          TableName=event["ResourceProperties"]["RealTable"],
+                          Item={
+                              "id":    {"S": "prod-001"},
+                              "name":  {"S": "Builders Hoodie"},
+                              "price": {"N": "49"},
+                              "stock": {"N": "100"},
+                          },
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  SeedRealData:
+    Type: Custom::SeedRealData
+    DependsOn: RealDataTable
+    Properties:
+      ServiceToken: !GetAtt SeederFunction.Arn
+      RealTable: !Ref RealDataTable
+
+  # ── CloudWatch Alarms — all stay GREEN (no errors, just wrong data) ────────────
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: phantom-fn-errors
+      AlarmDescription: >
+        Lambda error count. Stays GREEN — the function never throws, it just reads
+        from the wrong table and returns 200 with stale data.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AppFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: phantom-api-latency
+      AlarmDescription: >
+        API Gateway latency. Stays GREEN — fast responses because the shadow table
+        returns nothing (no scan cost), just wrong data.
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiName
+          Value: phantom-deploy-api
+        - Name: Stage
+          Value: prod
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiEndpoint:
+    Description: >
+      Call this URL — it returns HTTP 200 OK with {"product":"unknown","price":"0","status":"ok"}.
+      After the fix it should return {"product":"Builders Hoodie","price":"49","status":"ok"}.
+    Value: !Sub https://${PhantomApi}.execute-api.${AWS::Region}.amazonaws.com/prod/product
+  FunctionName:
+    Description: >
+      The Lambda function. Code is correct — inspect its Environment Variables tab.
+    Value: !Ref AppFunction
+  RealTableName:
+    Description: Has correct product data. Lambda should be reading from this table.
+    Value: !Ref RealDataTable
+  ShadowTableName:
+    Description: Empty. Lambda is incorrectly reading from this table.
+    Value: !Ref ShadowDataTable
